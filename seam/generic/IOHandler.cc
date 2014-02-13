@@ -26,6 +26,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #define GetLastError() errno
+#elif USE_EPOLL
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#define GetLastError() errno
 #else
 #include <sys/types.h>
 #include <sys/time.h>
@@ -42,6 +47,16 @@
 #include "generic/IOHandler.hh"
 
 namespace {
+
+  // Return error message string containing additional information based on
+  // errno. The returned string is static and will be overwritten in a future
+  // call. It is expected that the Error(...) function will be called soon
+  // after this.
+  char* ErrnoMessage(const char* msg) {
+    static char buffer[512];
+    snprintf(buffer, sizeof(buffer), "%s (%s)", msg, strerror(errno));
+    return buffer;
+  }
 
   int max(int a, int b) {
     return a > b ? a : b;
@@ -121,7 +136,21 @@ namespace {
         }
       }
     }
-    
+
+#if USE_EPOLL
+    void EnterIntoFDSet(int epollFD) {
+      for (u_int i = GetNumberOfElements(); i--; ) {
+        int fd = Entry::FromWordDirect(GetNthElement(i))->GetFD();
+        struct epoll_event event;
+        event.data.fd = fd;
+        event.events = EPOLLIN | EPOLLOUT;
+        int res = epoll_ctl(epollFD, EPOLL_CTL_ADD, fd, &event);
+        if (res < 0) {
+          Error(ErrnoMessage("Set::EnterIntoFDSet"));
+        }
+      }
+    }
+#else
     void EnterIntoFDSet(fd_set *fdSet, int *maxFD) {
       for (u_int i = GetNumberOfElements(); i--; ) {
         int fd = Entry::FromWordDirect(GetNthElement(i))->GetFD();
@@ -129,7 +158,24 @@ namespace {
         FD_SET(fd, fdSet);
       }
     }
-    
+#endif
+
+#if USE_EPOLL
+    void Schedule(int epollFD, struct epoll_event* events, int nevents) {
+      for (int i = 0; i < nevents; ++i,++events) {
+        for (u_int j = 0; j < GetNumberOfElements(); ++j) {
+          Entry *entry = Entry::FromWordDirect(GetNthElement(j));
+          if (entry->GetFD() == events->data.fd) {
+            Future *future = entry->GetFuture();
+            future->ScheduleWaitingThreads();
+            future->Become(REF_LABEL, Store::IntToWord(0));
+            Queue::RemoveNthElement(j);
+            break;
+          }
+        }
+      }
+    }
+#else
     void Schedule(fd_set *fdSet) {
       u_int n = GetNumberOfElements();
       for (u_int i = 0; i < n; i++) {
@@ -144,9 +190,14 @@ namespace {
         }
       }
     }
+#endif
   };
-  
+
+#if USE_EPOLL
+  word Pollable;
+#else
   word Readable, Writable, Connected;
+#endif
 };
 
 int IOHandler::SocketPair(int type, int *sv) {
@@ -194,7 +245,10 @@ int IOHandler::SocketPair(int type, int *sv) {
 #endif
 }
 
+#if USE_WINSOCK
 int IOHandler::defaultFD;
+#endif
+
 
 void IOHandler::Init() {
 #if USE_WINSOCK
@@ -202,31 +256,58 @@ void IOHandler::Init() {
   WORD req_version = MAKEWORD(1, 1);
   if (WSAStartup(req_version, &wsa_data) != 0)
     Error("no usable WinSock DLL found");
-#endif
 
   int sv[2];
   if (SocketPair(SOCK_STREAM, sv) == -1)
     Error("socketpair failed");
   defaultFD = sv[0];
+#endif
+#if USE_EPOLL
+  Pollable = Set::New()->ToWord();
+  RootSet::Add(Pollable);
+#else
   Readable = Set::New()->ToWord();
   Writable = Set::New()->ToWord();
   Connected = Set::New()->ToWord();
   RootSet::Add(Readable);
   RootSet::Add(Writable);
   RootSet::Add(Connected);
+#endif
 }
 
 void IOHandler::Select(struct timeval *timeout) {
+#if USE_EPOLL
+  const int MAX_EVENTS = 64;
+  int ms = timeout ? ((timeout->tv_sec * 1000) + (timeout->tv_usec / 1000)) : -1;
+  struct epoll_event events[MAX_EVENTS];
+  int epollFD = epoll_create(MAX_EVENTS);
+  if (epollFD < 0) {
+      Error(ErrnoMessage("IOHandler::Select"));
+  }
+  Set *PollableSet = Set::FromWordDirect(Pollable);
+  PollableSet->EnterIntoFDSet(epollFD);
+
+  int ret = epoll_wait(epollFD, events, MAX_EVENTS, ms);
+  if (ret < 0) {
+      close(epollFD);
+      if (GetLastError() == EINTR)
+        return;
+      Error(ErrnoMessage("IOHandler::Select"));
+    } else if (ret > 0) {
+      PollableSet->Schedule(epollFD, events, ret);
+    }
+    close(epollFD);
+#else
   Set *ReadableSet = Set::FromWordDirect(Readable);
   Set *WritableSet = Set::FromWordDirect(Writable);
   Set *ConnectedSet = Set::FromWordDirect(Connected);
-  
+
   fd_set readFDs, writeFDs, exceptFDs;
   FD_ZERO(&readFDs);
   FD_ZERO(&writeFDs);
   FD_ZERO(&exceptFDs);
   int maxRead = -1, maxWrite = -1, maxExcept = -1;
-  
+
   ReadableSet->EnterIntoFDSet(&readFDs, &maxRead);
   WritableSet->EnterIntoFDSet(&writeFDs, &maxWrite);
   ConnectedSet->EnterIntoFDSet(&writeFDs, &maxWrite);
@@ -260,6 +341,7 @@ void IOHandler::Select(struct timeval *timeout) {
 #endif
     }
   }
+#endif
 }
 
 void IOHandler::Poll() {
@@ -284,12 +366,40 @@ void IOHandler::Block() {
 }
 
 void IOHandler::Purge() {
+#if USE_EPOLL
+  Set::FromWordDirect(Pollable)->Blank();
+#else
   Set::FromWordDirect(Readable)->Blank();
   Set::FromWordDirect(Writable)->Blank();
   Set::FromWordDirect(Connected)->Blank();
+#endif
 }
 
 bool IOHandler::IsReadable(int fd) {
+#if USE_EPOLL
+  struct epoll_event event;
+  int epollFD = epoll_create(1);
+  if (epollFD < 0) {
+    Error(ErrnoMessage("IOHandler::IsReadable"));
+  }
+  event.data.fd = fd;
+  event.events = EPOLLIN;
+  if (epoll_ctl(epollFD, EPOLL_CTL_ADD, fd, &event) < 0) {
+    Error(ErrnoMessage("IOHandler::IsReadable"));
+  }
+
+ retry:
+  int ret = epoll_wait(epollFD, &event, 1, 0);
+  if (ret < 0) {
+      if (GetLastError() == EINTR)
+        goto retry;
+      close(epollFD);
+      Error(ErrnoMessage("IOHandler::IsReadable"));
+  }
+
+  close(epollFD);
+  return ret != 0;
+#else
   fd_set readFDs;
   FD_ZERO(&readFDs);
   FD_SET(fd, &readFDs);
@@ -304,9 +414,37 @@ bool IOHandler::IsReadable(int fd) {
     Error("IOHandler::IsReadable");
   }
   return ret != 0;
+#endif
 }
 
 Future *IOHandler::WaitReadable(int fd) {
+#if USE_EPOLL
+  struct epoll_event event;
+  int epollFD = epoll_create(1);
+  if (epollFD < 0) {
+    Error(ErrnoMessage("IOHandler::WaitReadable"));
+  }
+  event.data.fd = fd;
+  event.events = EPOLLIN;
+  if (epoll_ctl(epollFD, EPOLL_CTL_ADD, fd, &event) < 0) {
+    Error(ErrnoMessage("IOHandler::WaitReadable"));
+  }
+ retry:
+  int ret = epoll_wait(epollFD, &event, 1, 0);
+  if (ret < 0) {
+      if (GetLastError() == EINTR)
+        goto retry;
+      close(epollFD);
+      Error(ErrnoMessage("IOHandler::WaitReadable"));
+  } else if (ret == 0) {
+    close(epollFD);
+    return Set::FromWordDirect(Pollable)->Add(fd);
+  }
+  else {
+    close(epollFD);
+    return INVALID_POINTER;
+  }
+#else
   fd_set readFDs;
   FD_ZERO(&readFDs);
   FD_SET(fd, &readFDs);
@@ -324,9 +462,33 @@ Future *IOHandler::WaitReadable(int fd) {
   } else {
     return INVALID_POINTER;
   }
+#endif
 }
 
 bool IOHandler::IsWritable(int fd) {
+#if USE_EPOLL
+  struct epoll_event event;
+  int epollFD = epoll_create(1);
+  if (epollFD < 0) {
+    Error(ErrnoMessage("IOHandler::IsWritable"));
+  }
+  event.data.fd = fd;
+  event.events = EPOLLOUT;
+  if (epoll_ctl(epollFD, EPOLL_CTL_ADD, fd, &event) < 0) {
+    Error(ErrnoMessage("IOHandler::IsWritable"));
+  }
+ retry:
+  int ret = epoll_wait(epollFD, &event, 1, 0);
+  if (ret < 0) {
+      if (GetLastError() == EINTR)
+        goto retry;
+      close(epollFD);
+      Error(ErrnoMessage("IOHandler::IsWritable"));
+  }
+
+  close(epollFD);
+  return ret != 0;
+#else
   fd_set writeFDs;
   FD_ZERO(&writeFDs);
   FD_SET(fd, &writeFDs);
@@ -341,9 +503,38 @@ bool IOHandler::IsWritable(int fd) {
     Error("IOHandler::IsWritable");
   }
   return ret != 0;
+#endif
 }
 
 Future *IOHandler::WaitWritable(int fd) {
+#if USE_EPOLL
+  struct epoll_event event;
+  int epollFD = epoll_create(1);
+  if (epollFD < 0) {
+    Error(ErrnoMessage("IOHandler::WaitWritable"));
+  }
+  event.data.fd = fd;
+  event.events = EPOLLOUT;
+  if (epoll_ctl(epollFD, EPOLL_CTL_ADD, fd, &event) < 0) {
+    Error(ErrnoMessage("IOHandler::WaitWritable"));
+  }
+
+ retry:
+  int ret = epoll_wait(epollFD, &event, 1, 0);
+  if (ret < 0) {
+      if (GetLastError() == EINTR)
+        goto retry;
+      close(epollFD);
+      Error(ErrnoMessage("IOHandler::WaitWritable"));
+  } else if (ret == 0) {
+    close(epollFD);
+    return Set::FromWordDirect(Pollable)->Add(fd);
+  }
+  else {
+    close(epollFD);
+    return INVALID_POINTER;
+  }
+#else
   fd_set writeFDs;
   FD_ZERO(&writeFDs);
   FD_SET(fd, &writeFDs);
@@ -361,14 +552,23 @@ Future *IOHandler::WaitWritable(int fd) {
   } else {
     return INVALID_POINTER;
   }
+#endif
 }
 
 Future *IOHandler::WaitConnected(int fd) {
+#if USE_EPOLL
+  return Set::FromWordDirect(Pollable)->Add(fd);
+#else
   return Set::FromWordDirect(Connected)->Add(fd);
+#endif
 }
 
 void IOHandler::Close(int fd) {
+#if USE_EPOLL
+  Set::FromWordDirect(Pollable)->Remove(fd);
+#else
   Set::FromWordDirect(Readable)->Remove(fd);
   Set::FromWordDirect(Writable)->Remove(fd);
   Set::FromWordDirect(Connected)->Remove(fd);
+#endif
 }

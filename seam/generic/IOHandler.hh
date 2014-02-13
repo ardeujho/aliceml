@@ -25,7 +25,9 @@ class Future;
 
 class SeamDll IOHandler {
 protected:
+#if USE_WINSOCK
   static int defaultFD;
+#endif
   static void Select(struct timeval *timeout);
 public:
   static void Init();
